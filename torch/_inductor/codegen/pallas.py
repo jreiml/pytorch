@@ -1064,6 +1064,10 @@ class PallasKernel(SIMDKernel):
 
         The iteration variables (x0, x1, x2, x3) are already defined as jnp.arange arrays
         in the kernel. We just need to convert the sympy expression to JAX code.
+
+        Note: For expand patterns with total_var, the index expression is rewritten
+        during codegen_kernel() post-processing to derive iteration var values from
+        the total_var, ensuring correct element ordering.
         """
         free_symbols = index.free_symbols
         iter_vars = self._get_iter_vars()
@@ -3145,10 +3149,6 @@ def _pallas_partial_reduce(reduce_fn, v, pw_numel, red_numel):
                 # multiple consecutive output dimensions (e.g., batch * channels)
                 var_multi_dim_span: dict[int, tuple[int, int]] = {}
 
-                # Track NON-CONTIGUOUS dimension spans: var_idx -> list of dims
-                # This handles expand+transpose patterns where a var spans
-                # non-adjacent output dimensions (e.g., batch*seq with transpose)
-                var_noncontig_dims: dict[int, list[int]] = {}
 
                 for idx, (var_sym, entry) in enumerate(var_items):
                     if idx == total_var_idx:
@@ -3198,54 +3198,16 @@ def _pallas_partial_reduce(reduce_fn, v, pw_numel, red_numel):
 
                                 # Fallback: trust coefficient analysis even if length
                                 # doesn't match dimension size or any span product
-                                var_to_dim[idx] = matched_dim
-                                break
+                                # BUT: if there's a total_var, the store expression uses
+                                # total indexing, so coefficients for other vars are unreliable
+                                if total_var_idx is None:
+                                    var_to_dim[idx] = matched_dim
+                                    break
+                                # With total_var, don't trust mismatched coefficients
                         if var_to_dim.get(idx) is not None:
                             continue
 
                     var_to_dim[idx] = None  # Will use positional fallback
-
-                # When there's a total_var, try to detect non-contiguous dimension spans
-                # for vars that weren't assigned via coefficient analysis.
-                # This handles expand+transpose patterns like GQA where a var
-                # spans non-adjacent dims (e.g., batch*seq with output [B,H,S,D])
-                if total_var_idx is not None and output_shape:
-                    for idx, (var_sym, entry) in enumerate(var_items):
-                        if idx == total_var_idx or var_to_dim.get(idx) is not None:
-                            continue
-                        if idx in var_multi_dim_span:
-                            continue  # Already has contiguous span
-
-                        length_val = self._safe_int(entry.length)
-                        if length_val is None or length_val <= 1:
-                            continue
-
-                        # Try to factor length into non-contiguous output dims
-                        # Use subset enumeration (2^n possibilities)
-                        n_dims = len(output_shape)
-                        for mask in range(1, (1 << n_dims)):
-                            # Skip single-dimension cases (handled elsewhere)
-                            if bin(mask).count("1") <= 1:
-                                continue
-
-                            product = 1
-                            dims_in_mask = []
-                            for d in range(n_dims):
-                                if mask & (1 << d):
-                                    product *= output_shape[d]
-                                    dims_in_mask.append(d)
-
-                            if product == length_val:
-                                # Found a factorization
-                                # Check if it's contiguous
-                                is_contiguous = dims_in_mask == list(
-                                    range(dims_in_mask[0], dims_in_mask[-1] + 1)
-                                )
-                                if not is_contiguous:
-                                    # Non-contiguous span found
-                                    var_noncontig_dims[idx] = dims_in_mask
-                                    var_to_dim[idx] = dims_in_mask[-1]  # Mark as assigned
-                                    break
 
                 # Identify reduction vars first (they get special handling)
                 reduction_var_indices = {
@@ -3332,21 +3294,6 @@ def _pallas_partial_reduce(reduce_fn, v, pw_numel, red_numel):
                                 shape_parts.append(str(output_shape[d]))
                             else:
                                 shape_parts.append("1")
-                        # Add trailing 1s for reduction dimensions
-                        while len(shape_parts) < total_rank:
-                            shape_parts.append("1")
-                        shape_str = ", ".join(shape_parts)
-                        kernel_body.writeline(
-                            f"{var_name} = jnp.arange({length_str}).reshape({shape_str})"
-                        )
-                    elif idx in var_noncontig_dims and output_shape:
-                        # Var spans multiple NON-CONTIGUOUS output dimensions
-                        # E.g., var with length 32 for output [2, 4, 16, 16]
-                        # spans dims 0,2 (batch*seq), so reshape to (2, 1, 16, 1)
-                        dims = var_noncontig_dims[idx]
-                        shape_parts: list[str] = ["1"] * num_output_dims
-                        for d in dims:
-                            shape_parts[d] = str(output_shape[d])
                         # Add trailing 1s for reduction dimensions
                         while len(shape_parts) < total_rank:
                             shape_parts.append("1")
@@ -3554,8 +3501,114 @@ def _pallas_partial_reduce(reduce_fn, v, pw_numel, red_numel):
                     shape_str = ", ".join(str(s) for s in target_shape)
                     reshape_map[cse_var] = shape_str
 
+            # Build iteration var substitution map for expand patterns with total_var
+            # When there's a total_var covering all output positions and strided loads
+            # use other iteration vars, we need to derive those var values from total_var
+            # to ensure correct element ordering in the output
+            iter_var_substitutions: dict[str, str] = {}
+            if total_var_idx is not None and output_shape:
+                total_var_sym, _ = var_items[total_var_idx]
+                total_var_str = str(total_var_sym)
+
+                # Build substitutions for non-total vars used in load expressions
+                # that aren't correctly mapped to output dimensions
+                assigned_dims_set: set[int] = set()
+
+                # Sort non-total vars by name for deterministic processing
+                non_total_vars = sorted(
+                    [(idx, sym, entry) for idx, (sym, entry) in enumerate(var_items)
+                     if idx != total_var_idx and sym in used_vars],
+                    key=lambda x: str(x[1])
+                )
+
+                for idx, var_sym, entry in non_total_vars:
+                    var_length = self._safe_int(entry.length)
+                    if var_length is None or var_length <= 1:
+                        continue
+
+                    var_name = str(var_sym)
+
+                    # Try single dim first (rightmost available)
+                    found = False
+                    for d in range(len(output_shape) - 1, -1, -1):
+                        if d in assigned_dims_set:
+                            continue
+                        if output_shape[d] == var_length:
+                            dim_stride = output_strides[d]
+                            dim_size = output_shape[d]
+                            if d == len(output_shape) - 1:
+                                expr = f"({total_var_str} % {dim_size})"
+                            else:
+                                expr = f"(({total_var_str} // {dim_stride}) % {dim_size})"
+                            iter_var_substitutions[var_name] = expr
+                            assigned_dims_set.add(d)
+                            found = True
+                            break
+
+                    if found:
+                        continue
+
+                    # Try contiguous spans
+                    for end_dim in range(len(output_shape) - 1, -1, -1):
+                        if end_dim in assigned_dims_set:
+                            continue
+                        product = output_shape[end_dim]
+                        span_dims = [end_dim]
+                        for start_dim in range(end_dim - 1, -1, -1):
+                            if start_dim in assigned_dims_set:
+                                break
+                            product *= output_shape[start_dim]
+                            span_dims.insert(0, start_dim)
+                            if product == var_length:
+                                end_stride = output_strides[end_dim]
+                                if end_dim == len(output_shape) - 1:
+                                    expr = f"({total_var_str} % {product})"
+                                else:
+                                    expr = f"(({total_var_str} // {end_stride}) % {product})"
+                                iter_var_substitutions[var_name] = expr
+                                for dd in span_dims:
+                                    assigned_dims_set.add(dd)
+                                found = True
+                                break
+                            elif product > var_length:
+                                break
+                        if found:
+                            break
+
+                    if found:
+                        continue
+
+                    # Try non-contiguous dims (expand pattern)
+                    available = [d for d in range(len(output_shape)) if d not in assigned_dims_set]
+                    for mask in range(1, (1 << len(available))):
+                        dims_in_mask = [available[i] for i in range(len(available)) if mask & (1 << i)]
+                        product = 1
+                        for d in dims_in_mask:
+                            product *= output_shape[d]
+                        if product == var_length:
+                            parts = []
+                            var_stride = 1
+                            for d in reversed(sorted(dims_in_mask)):
+                                dim_size = output_shape[d]
+                                out_stride = output_strides[d]
+                                if d == len(output_shape) - 1:
+                                    pos_expr = f"({total_var_str} % {dim_size})"
+                                else:
+                                    pos_expr = f"(({total_var_str} // {out_stride}) % {dim_size})"
+                                if var_stride == 1:
+                                    parts.append(pos_expr)
+                                else:
+                                    parts.append(f"{var_stride}*{pos_expr}")
+                                var_stride *= dim_size
+                            iter_var_substitutions[var_name] = "(" + " + ".join(reversed(parts)) + ")"
+                            for dd in dims_in_mask:
+                                assigned_dims_set.add(dd)
+                            found = True
+                            break
+
             # Emit compute (CSE) and store lines
             # Apply reshape or transpose to assignments of tracked CSE variables
+            import re
             for line in self.compute._lines:
                 line_str = str(line)
 
@@ -3576,6 +3629,15 @@ def _pallas_partial_reduce(reduce_fn, v, pw_numel, red_numel):
                                 # Standard reshape
                                 line_str = f"{cse_var} = ({rhs}).reshape({transform_str})"
                             break
+
+                # Apply iteration var substitutions for expand patterns
+                # This rewrites strided load expressions to use total_var-derived values
+                # Pattern: "... = ptr[...].flatten()[index_expr]" where index_expr uses x0, x1, etc.
+                if iter_var_substitutions and ".flatten()[" in line_str:
+                    for var_name, expr in iter_var_substitutions.items():
+                        # Replace variable name with derived expression
+                        # Use word boundary to avoid partial matches (x0 vs x01)
+                        line_str = re.sub(rf"\b{var_name}\b", expr, line_str)
 
                 kernel_body.writeline(line_str)
 
